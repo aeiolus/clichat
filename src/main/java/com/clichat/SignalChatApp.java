@@ -9,7 +9,10 @@ import com.googlecode.lanterna.screen.TerminalScreen;
 import com.googlecode.lanterna.terminal.DefaultTerminalFactory;
 import com.googlecode.lanterna.terminal.Terminal;
 
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.regex.Pattern;
@@ -26,21 +29,61 @@ public class SignalChatApp {
     private Map<String, List<SignalCliWrapper.Message>> messageHistory;
     private TextBox messagesBox;
     private ActionListBox contactsList;
+    private MessageDatabase database;
+    private ImageRenderer imageRenderer;
 
     public SignalChatApp() {
         try {
             config = new Config();
             signalCli = new SignalCliWrapper(config.getPhoneNumber());
             messageHistory = new HashMap<>();
+            database = new MessageDatabase(config.getPhoneNumber());
+            imageRenderer = new ImageRenderer();
             setupTerminal();
+
+            // Load message history from database
+            loadMessageHistoryFromDatabase();
 
             // Start receiving messages in background
             signalCli.addMessageListener(message -> {
+                // System.out.println("Message listener called with message: " + message);
                 String recipient = message.getSourceNumber();
                 if (recipient == null || recipient.isEmpty()) {
                     recipient = config.getPhoneNumber();
                 }
-                addMessage(recipient, message.getContent(), message.isSent());
+                // System.out.println("Adding message to history for recipient: " + recipient + ", current recipient is: " + currentRecipient);
+
+                try {
+                    // Save message to database
+                    database.saveMessage(message);
+
+                    // Save any attachments
+                    for (SignalCliWrapper.Attachment attachment : message.getAttachments()) {
+                        File tempFile = File.createTempFile("signal-", "-attachment");
+                        try {
+                            Files.write(tempFile.toPath(), attachment.getData());
+                            database.saveAttachment(message.getTimestamp(), tempFile, attachment.getContentType());
+                        } finally {
+                            tempFile.delete();
+                        }
+                    }
+
+                    // Update in-memory history
+                    messageHistory.computeIfAbsent(recipient, k -> Collections.synchronizedList(new ArrayList<>()));
+                    List<SignalCliWrapper.Message> messages = messageHistory.get(recipient);
+                    synchronized (messages) {
+                        messages.add(message);
+                        // System.out.println("Message history for " + recipient + " now has " + messages.size() + " messages");
+                    }
+
+                    if (recipient.equals(currentRecipient)) {
+                        // System.out.println("Updating messages view for current recipient");
+                        updateMessagesView();
+                    }
+                } catch (SQLException | IOException e) {
+                    System.err.println("Error saving message to database: " + e.getMessage());
+                    e.printStackTrace();
+                }
             });
             signalCli.startReceiving();
 
@@ -48,19 +91,38 @@ public class SignalChatApp {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 try {
                     signalCli.stopReceiving();
+                    database.close();
                     if (screen != null) {
                         screen.stopScreen();
                     }
                     if (terminal != null) {
                         terminal.close();
                     }
-                } catch (IOException e) {
+                } catch (IOException | SQLException e) {
                     System.err.println("Error during shutdown: " + e.getMessage());
                 }
             }));
-        } catch (IOException e) {
+        } catch (IOException | SQLException e) {
             System.err.println("Failed to initialize Signal Chat App: " + e.getMessage());
             System.exit(1);
+        }
+    }
+
+    private void loadMessageHistoryFromDatabase() {
+        try {
+            // Clear existing history
+            messageHistory.clear();
+
+            // Load contacts
+            List<SignalCliWrapper.Contact> contacts = signalCli.listContacts();
+            for (SignalCliWrapper.Contact contact : contacts) {
+                String recipient = contact.getNumber();
+                List<SignalCliWrapper.Message> messages = database.loadMessages(recipient);
+                messageHistory.put(recipient, Collections.synchronizedList(new ArrayList<>(messages)));
+            }
+        } catch (SQLException | IOException e) {
+            System.err.println("Error loading message history from database: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -82,23 +144,48 @@ public class SignalChatApp {
     }
 
     private void updateMessagesView() {
-        if (currentRecipient != null && messageHistory.containsKey(currentRecipient)) {
-            // Format and display messages
-            StringBuilder formattedMessages = new StringBuilder();
-            List<SignalCliWrapper.Message> messages = messageHistory.get(currentRecipient);
-            synchronized (messages) {
-                // Sort messages by timestamp
-                messages.sort(Comparator.comparingLong(SignalCliWrapper.Message::getTimestamp));
+        try {
+            // System.out.println("updateMessagesView called, currentRecipient=" + currentRecipient);
+            if (currentRecipient != null && messageHistory.containsKey(currentRecipient)) {
+                // Format and display messages
+                StringBuilder formattedMessages = new StringBuilder();
+                List<SignalCliWrapper.Message> messages = messageHistory.get(currentRecipient);
+                // System.out.println("Found " + messages.size() + " messages for " + currentRecipient);
+                synchronized (messages) {
+                    // Sort messages by timestamp
+                    messages.sort(Comparator.comparingLong(SignalCliWrapper.Message::getTimestamp));
 
-                for (SignalCliWrapper.Message msg : messages) {
-                    String timestamp = DATE_FORMAT.format(new Date(msg.getTimestamp()));
-                    String prefix = msg.isSent() ? "You" : "Them";
-                    formattedMessages.append(String.format("[%s] %s: %s\n", timestamp, prefix, msg.getContent()));
+                    for (SignalCliWrapper.Message msg : messages) {
+                        String timestamp = DATE_FORMAT.format(new Date(msg.getTimestamp()));
+                        String prefix = msg.isSent() ? "You" : "Them";
+                        formattedMessages.append(String.format("[%s] %s: %s\n", timestamp, prefix, msg.getContent()));
+
+                        // Handle attachments
+                        for (SignalCliWrapper.Attachment attachment : msg.getAttachments()) {
+                            File file = new File(attachment.getFilePath());
+                            if (imageRenderer.isImageFile(file.getName())) {
+                                // Get terminal width for scaling
+                                TerminalSize size = terminal.getTerminalSize();
+                                int maxWidth = size.getColumns() - 4; // Leave some margin
+
+                                // Render and append image
+                                String renderedImage = imageRenderer.renderImage(file, maxWidth);
+                                formattedMessages.append(renderedImage).append("\n");
+                            } else {
+                                formattedMessages.append(String.format("[Attachment: %s]\n", file.getName()));
+                            }
+                        }
+                    }
                 }
+                // System.out.println("Setting messages text: " + formattedMessages.toString());
+                messagesBox.setText(formattedMessages.toString());
+            } else {
+                // System.out.println("No messages found for current recipient");
+                messagesBox.setText("");
             }
-            messagesBox.setText(formattedMessages.toString());
-        } else {
-            messagesBox.setText("");
+        } catch (IOException e) {
+            System.err.println("Error updating messages view: " + e.getMessage());
+            messagesBox.setText("[Error displaying messages]");
         }
     }
 
@@ -106,7 +193,7 @@ public class SignalChatApp {
         messageHistory.computeIfAbsent(recipient, k -> Collections.synchronizedList(new ArrayList<>()));
         List<SignalCliWrapper.Message> messages = messageHistory.get(recipient);
         synchronized (messages) {
-            messages.add(new SignalCliWrapper.Message(message, new Date().getTime(), sent, recipient));
+            messages.add(new SignalCliWrapper.Message(message, System.currentTimeMillis(), sent, recipient));
         }
         if (recipient.equals(currentRecipient)) {
             updateMessagesView();
@@ -117,106 +204,67 @@ public class SignalChatApp {
         try {
             List<SignalCliWrapper.Contact> contacts = signalCli.listContacts();
             for (SignalCliWrapper.Contact contact : contacts) {
+                String number = contact.getNumber();
                 contactsList.addItem(contact.getDisplayName(), () -> {
-                    currentRecipient = contact.getNumber();
+                    currentRecipient = number;
                     updateMessagesView();
                 });
             }
         } catch (IOException e) {
+            System.err.println("Error loading contacts: " + e.getMessage());
             MessageDialog.showMessageDialog(gui, "Error", "Failed to load contacts: " + e.getMessage());
         }
     }
 
     private void showMainWindow() throws IOException {
-        // Get terminal size
-        TerminalSize terminalSize = screen.getTerminalSize();
-
-        // Create the main window that uses full terminal size
+        // Create main window
         BasicWindow window = new BasicWindow("Signal Chat");
         window.setHints(Arrays.asList(Window.Hint.FULL_SCREEN));
 
-        // Main panel with 2 columns
-        Panel mainPanel = new Panel(new GridLayout(2));
-        mainPanel.setPreferredSize(terminalSize);
+        // Create panels with specific sizes
+        Panel mainPanel = new Panel(new LinearLayout(Direction.HORIZONTAL));
+        Panel leftPanel = new Panel(new LinearLayout(Direction.VERTICAL));
+        Panel rightPanel = new Panel(new LinearLayout(Direction.VERTICAL));
 
-        // Calculate sizes for left and right panels
-        int leftWidth = terminalSize.getColumns() / 4; // 25% of width for contacts
-        int rightWidth = terminalSize.getColumns() - leftWidth - 2; // Remaining width for messages
-        int height = terminalSize.getRows() - 4; // Leave some space for borders and input
+        // Configure panel sizes
+        leftPanel.setLayoutData(LinearLayout.createLayoutData(LinearLayout.Alignment.Beginning, LinearLayout.GrowPolicy.None));
+        rightPanel.setLayoutData(LinearLayout.createLayoutData(LinearLayout.Alignment.Fill, LinearLayout.GrowPolicy.CanGrow));
 
-        // Left column - Contacts
-        Panel contactsPanel = new Panel(new GridLayout(1));
-        contactsPanel.setPreferredSize(new TerminalSize(leftWidth, height));
-
-        contactsList = new ActionListBox(new TerminalSize(leftWidth - 2, height - 2));
-        contactsList.addItem("+ Add Contact", () -> {
-            MessageDialog.showMessageDialog(gui, "Add Contact", "Enter phone number in the message input below");
-            currentRecipient = null;
-            updateMessagesView();
-        });
-
-        // Load existing contacts
+        // Add components
+        contactsList = new ActionListBox();
+        contactsList.setPreferredSize(new TerminalSize(20, 10));
+        leftPanel.addComponent(contactsList);
         loadContacts();
 
-        contactsPanel.addComponent(contactsList);
-        mainPanel.addComponent(contactsPanel.withBorder(Borders.singleLine("Contacts")));
-
-        // Right column - Messages and Input
-        Panel rightPanel = new Panel(new GridLayout(1));
-        rightPanel.setPreferredSize(new TerminalSize(rightWidth, height));
-
-        // Messages view
-        messagesBox = new TextBox(new TerminalSize(rightWidth - 2, height - 4));
+        messagesBox = new TextBox();
         messagesBox.setReadOnly(true);
-        Panel messagesPanel = new Panel(new GridLayout(1));
-        messagesPanel.addComponent(messagesBox);
-        rightPanel.addComponent(messagesPanel.withBorder(Borders.singleLine("Messages")));
+        messagesBox.setPreferredSize(new TerminalSize(60, 20));
+        rightPanel.addComponent(messagesBox);
 
-        // Input panel at bottom
-        Panel inputPanel = new Panel(new GridLayout(2));
-        TextBox messageInput = new TextBox(new TerminalSize(rightWidth - 10, 1));
-        inputPanel.addComponent(messageInput);
-        
+        TextBox inputBox = new TextBox();
+        inputBox.setPreferredSize(new TerminalSize(60, 1));
         Button sendButton = new Button("Send", () -> {
             try {
-                String message = messageInput.getText().trim();
-                if (message.isEmpty()) {
-                    return;
+                String message = inputBox.getText();
+                if (!message.isEmpty() && currentRecipient != null) {
+                    signalCli.sendMessage(currentRecipient, message);
+                    addMessage(currentRecipient, message, true);
+                    inputBox.setText("");
                 }
-
-                // If no recipient is selected, treat input as a phone number
-                if (currentRecipient == null) {
-                    String newContact = message;
-                    if (!PHONE_NUMBER_PATTERN.matcher(newContact).matches()) {
-                        MessageDialog.showMessageDialog(gui, "Error", "Invalid phone number format. Use international format (e.g., +1234567890)");
-                        return;
-                    }
-                    currentRecipient = newContact;
-                    contactsList.addItem(newContact, () -> {
-                        currentRecipient = newContact;
-                        updateMessagesView();
-                    });
-                    messageInput.setText("");
-                    return;
-                }
-
-                // Send the message to current recipient
-                String result = signalCli.sendMessage(currentRecipient, message);
-                addMessage(currentRecipient, message, true);
-                messageInput.setText("");
             } catch (IOException e) {
                 MessageDialog.showMessageDialog(gui, "Error", "Failed to send message: " + e.getMessage());
             }
         });
+
+        Panel inputPanel = new Panel(new LinearLayout(Direction.HORIZONTAL));
+        inputPanel.addComponent(inputBox);
         inputPanel.addComponent(sendButton);
-        rightPanel.addComponent(inputPanel.withBorder(Borders.singleLine()));
+        rightPanel.addComponent(inputPanel);
 
+        mainPanel.addComponent(leftPanel);
         mainPanel.addComponent(rightPanel);
-
-        // Add the main panel to the window
         window.setComponent(mainPanel);
 
-        // Show the window
         gui.addWindowAndWait(window);
     }
 

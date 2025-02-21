@@ -75,73 +75,124 @@ public class SignalCliWrapper {
     public void startReceiving() {
         synchronized (sendLock) {
             if (running) {
+                // System.out.println("Receive thread already running, skipping start");
                 return;
             }
             running = true;
+            // System.out.println("Starting receive thread...");
 
             // Start signal-cli receive in background
             receiveThread = new Thread(() -> {
-                try {
-                    ProcessBuilder pb = new ProcessBuilder(
-                        "signal-cli", "-u", phoneNumber, "-o", "json", "receive", "--timeout", "-1"
-                    );
-                    receiveProcess = pb.start();
+                while (running) {
+                    try {
+                        ProcessBuilder pb = new ProcessBuilder(
+                                "signal-cli", "-u", phoneNumber, "-o", "json", "receive", "--timeout", "5"
+                        );
+                        // System.out.println("Starting signal-cli receive process: " + String.join(" ", pb.command()));
+                        receiveProcess = pb.start();
 
-                    // Read the output continuously
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(receiveProcess.getInputStream()));
-                    String line;
-                    while (running && (line = reader.readLine()) != null) {
-                        if (line.contains("\"envelope\"")) {
+                        // Read the output continuously
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(receiveProcess.getInputStream()));
+                        BufferedReader errorReader = new BufferedReader(new InputStreamReader(receiveProcess.getErrorStream()));
+
+                        // Start error reader thread
+                        Thread errorThread = new Thread(() -> {
                             try {
-                                JSONObject json = new JSONObject(line);
-                                JSONObject envelope = json.getJSONObject("envelope");
-
-                                String sourceNumber = envelope.optString("sourceNumber", "");
-                                String sourceName = envelope.optString("sourceName", "");
-                                long timestamp = envelope.optLong("timestamp", 0);
-
-                                JSONObject dataMessage = envelope.optJSONObject("dataMessage");
-                                if (dataMessage != null) {
-                                    String messageText = dataMessage.optString("message", "");
-                                    boolean sent = sourceNumber.isEmpty() || sourceNumber.equals(phoneNumber);
-                                    Message message = new Message(messageText, timestamp, sent, sourceNumber);
-
-                                    // Notify listeners of new message
-                                    for (MessageListener listener : messageListeners) {
-                                        listener.onMessageReceived(message);
-                                    }
+                                String line;
+                                while ((line = errorReader.readLine()) != null) {
+                                    System.err.println("signal-cli receive error: " + line);
                                 }
-                            } catch (JSONException e) {
-                                System.err.println("Failed to parse message JSON: " + e.getMessage());
+                            } catch (IOException e) {
+                                if (running) {
+                                    System.err.println("Error reading from signal-cli error stream: " + e.getMessage());
+                                }
+                            }
+                        });
+                        errorThread.start();
+
+                        String line;
+                        // System.out.println("Waiting for messages...");
+                        while (running && (line = reader.readLine()) != null) {
+                            // System.out.println("Received line: " + line);
+                            if (line.contains("\"envelope\"")) {
+                                try {
+                                    JSONObject json = new JSONObject(line);
+                                    JSONObject envelope = json.getJSONObject("envelope");
+
+                                    String sourceNumber = envelope.optString("sourceNumber", "");
+                                    String sourceName = envelope.optString("sourceName", "");
+                                    long timestamp = envelope.optLong("timestamp", 0);
+
+                                    JSONObject dataMessage = envelope.optJSONObject("dataMessage");
+                                    if (dataMessage != null) {
+                                        String messageText = dataMessage.optString("message", "");
+                                        // System.out.println("Processing message from " + sourceNumber + ": " + messageText);
+                                        boolean sent = sourceNumber.isEmpty() || sourceNumber.equals(phoneNumber);
+                                        Message message = new Message(messageText, timestamp, sent, sourceNumber);
+
+                                        // Notify listeners of new message
+                                        // System.out.println("Notifying " + messageListeners.size() + " listeners of message: " + message);
+                                        for (MessageListener listener : messageListeners) {
+                                            listener.onMessageReceived(message);
+                                        }
+                                    }
+                                } catch (JSONException e) {
+                                    System.err.println("Failed to parse message JSON: " + e.getMessage());
+                                    System.err.println("Raw JSON: " + line);
+                                }
                             }
                         }
-                    }
-                } catch (IOException e) {
-                    if (running) {
-                        System.err.println("Error in receive thread: " + e.getMessage());
+                        // System.out.println("Receive process ended, restarting in 1 second...");
+                        Thread.sleep(1000);
+                    } catch (IOException | InterruptedException e) {
+                        if (running) {
+                            System.err.println("Error in receive thread: " + e.getMessage());
+                            e.printStackTrace();
+                            try {
+                                Thread.sleep(1000);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
+                    } finally {
+                        if (receiveProcess != null) {
+                            receiveProcess.destroy();
+                            receiveProcess = null;
+                        }
                     }
                 }
+                // System.out.println("Receive thread loop ended. running=" + running);
             });
+            receiveThread.setName("SignalReceiveThread");
             receiveThread.start();
+            // System.out.println("Receive thread started");
         }
     }
 
     public void stopReceiving() {
         synchronized (sendLock) {
+            // System.out.println("Stopping receive thread...");
             running = false;
             if (receiveProcess != null) {
+                // System.out.println("Destroying receive process");
                 receiveProcess.destroy();
             }
             if (receiveThread != null) {
+                // System.out.println("Interrupting receive thread");
                 receiveThread.interrupt();
                 try {
+                    // System.out.println("Waiting for receive thread to finish");
                     receiveThread.join(1000);
+                    // System.out.println("Receive thread finished");
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    System.err.println("Interrupted while waiting for receive thread");
                 }
             }
             receiveProcess = null;
             receiveThread = null;
+            // System.out.println("Receive thread stopped");
         }
     }
 
@@ -312,12 +363,18 @@ public class SignalCliWrapper {
         private final long timestamp;
         private final boolean sent;
         private final String sourceNumber;
+        private final List<Attachment> attachments;
 
         public Message(String content, long timestamp, boolean sent, String sourceNumber) {
+            this(content, timestamp, sent, sourceNumber, new ArrayList<>());
+        }
+
+        public Message(String content, long timestamp, boolean sent, String sourceNumber, List<Attachment> attachments) {
             this.content = content;
             this.timestamp = timestamp;
             this.sent = sent;
             this.sourceNumber = sourceNumber;
+            this.attachments = attachments;
         }
 
         public String getContent() {
@@ -334,6 +391,40 @@ public class SignalCliWrapper {
 
         public String getSourceNumber() {
             return sourceNumber;
+        }
+
+        public List<Attachment> getAttachments() {
+            return attachments;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("Message{content='%s', timestamp=%d, sent=%b, sourceNumber='%s', attachments=%d}",
+                    content, timestamp, sent, sourceNumber, attachments.size());
+        }
+    }
+
+    public static class Attachment {
+        private final String filePath;
+        private final String contentType;
+        private final byte[] data;
+
+        public Attachment(String filePath, String contentType, byte[] data) {
+            this.filePath = filePath;
+            this.contentType = contentType;
+            this.data = data;
+        }
+
+        public String getFilePath() {
+            return filePath;
+        }
+
+        public String getContentType() {
+            return contentType;
+        }
+
+        public byte[] getData() {
+            return data;
         }
     }
 

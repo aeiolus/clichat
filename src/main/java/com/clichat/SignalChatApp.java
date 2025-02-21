@@ -37,7 +37,8 @@ public class SignalChatApp {
     }
 
     private void setupTerminal() throws IOException {
-        terminal = new DefaultTerminalFactory().createTerminal();
+        DefaultTerminalFactory terminalFactory = new DefaultTerminalFactory();
+        terminal = terminalFactory.createTerminal();
         screen = new TerminalScreen(terminal);
         screen.startScreen();
         gui = new MultiWindowTextGUI(screen, new DefaultWindowManager(), new EmptySpace(TextColor.ANSI.BLACK));
@@ -74,35 +75,49 @@ public class SignalChatApp {
     }
 
     private void showMainWindow() throws IOException {
-        // Create the main window
+        // Get terminal size
+        TerminalSize terminalSize = screen.getTerminalSize();
+
+        // Create the main window that uses full terminal size
         BasicWindow window = new BasicWindow("Signal Chat");
+        window.setHints(Arrays.asList(Window.Hint.FULL_SCREEN));
+
+        // Main panel with 2 columns
         Panel mainPanel = new Panel(new GridLayout(2));
+        mainPanel.setPreferredSize(terminalSize);
+
+        // Calculate sizes for left and right panels
+        int leftWidth = terminalSize.getColumns() / 4; // 25% of width for contacts
+        int rightWidth = terminalSize.getColumns() - leftWidth - 2; // Remaining width for messages
+        int height = terminalSize.getRows() - 4; // Leave some space for borders and input
 
         // Left column - Contacts
         Panel contactsPanel = new Panel(new GridLayout(1));
-        contactsPanel.setPreferredSize(new TerminalSize(20, 20));
-        
-        ActionListBox contactsList = new ActionListBox(new TerminalSize(18, 18));
+        contactsPanel.setPreferredSize(new TerminalSize(leftWidth, height));
+
+        ActionListBox contactsList = new ActionListBox(new TerminalSize(leftWidth - 2, height - 2));
         contactsList.addItem("+ Add Contact", () -> {
             MessageDialog.showMessageDialog(gui, "Add Contact", "Enter phone number in the message input below");
             currentRecipient = null;
             updateMessagesView();
         });
         contactsPanel.addComponent(contactsList);
-        mainPanel.addComponent(contactsPanel);
+        mainPanel.addComponent(contactsPanel.withBorder(Borders.singleLine("Contacts")));
 
         // Right column - Messages and Input
         Panel rightPanel = new Panel(new GridLayout(1));
-        rightPanel.setPreferredSize(new TerminalSize(60, 20));
+        rightPanel.setPreferredSize(new TerminalSize(rightWidth, height));
 
         // Messages view
-        messagesBox = new TextBox(new TerminalSize(58, 16));
+        messagesBox = new TextBox(new TerminalSize(rightWidth - 2, height - 4));
         messagesBox.setReadOnly(true);
-        rightPanel.addComponent(messagesBox);
+        Panel messagesPanel = new Panel(new GridLayout(1));
+        messagesPanel.addComponent(messagesBox);
+        rightPanel.addComponent(messagesPanel.withBorder(Borders.singleLine("Messages")));
 
         // Input panel at bottom
         Panel inputPanel = new Panel(new GridLayout(2));
-        TextBox messageInput = new TextBox(new TerminalSize(45, 1));
+        TextBox messageInput = new TextBox(new TerminalSize(rightWidth - 10, 1));
         inputPanel.addComponent(messageInput);
         
         Button sendButton = new Button("Send", () -> {
@@ -137,7 +152,7 @@ public class SignalChatApp {
             }
         });
         inputPanel.addComponent(sendButton);
-        rightPanel.addComponent(inputPanel);
+        rightPanel.addComponent(inputPanel.withBorder(Borders.singleLine()));
 
         mainPanel.addComponent(rightPanel);
 

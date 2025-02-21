@@ -62,6 +62,7 @@ public class SignalCliWrapper {
     private Thread receiveThread;
     private volatile boolean running;
     private List<MessageListener> messageListeners = new ArrayList<>();
+    private final Object sendLock = new Object();
 
     public interface MessageListener {
         void onMessageReceived(Message message);
@@ -72,68 +73,118 @@ public class SignalCliWrapper {
     }
 
     public void startReceiving() {
-        if (running) {
-            return;
-        }
-        running = true;
+        synchronized (sendLock) {
+            if (running) {
+                return;
+            }
+            running = true;
 
-        // Start signal-cli receive in background
-        receiveThread = new Thread(() -> {
-            try {
-                ProcessBuilder pb = new ProcessBuilder(
+            // Start signal-cli receive in background
+            receiveThread = new Thread(() -> {
+                try {
+                    ProcessBuilder pb = new ProcessBuilder(
                         "signal-cli", "-u", phoneNumber, "-o", "json", "receive", "--timeout", "-1"
-                );
-                receiveProcess = pb.start();
+                    );
+                    receiveProcess = pb.start();
 
-                // Read the output continuously
-                BufferedReader reader = new BufferedReader(new InputStreamReader(receiveProcess.getInputStream()));
-                String line;
-                while (running && (line = reader.readLine()) != null) {
-                    if (line.contains("\"envelope\"")) {
-                        try {
-                            JSONObject json = new JSONObject(line);
-                            JSONObject envelope = json.getJSONObject("envelope");
+                    // Read the output continuously
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(receiveProcess.getInputStream()));
+                    String line;
+                    while (running && (line = reader.readLine()) != null) {
+                        if (line.contains("\"envelope\"")) {
+                            try {
+                                JSONObject json = new JSONObject(line);
+                                JSONObject envelope = json.getJSONObject("envelope");
 
-                            String sourceNumber = envelope.optString("sourceNumber", "");
-                            String sourceName = envelope.optString("sourceName", "");
-                            long timestamp = envelope.optLong("timestamp", 0);
+                                String sourceNumber = envelope.optString("sourceNumber", "");
+                                String sourceName = envelope.optString("sourceName", "");
+                                long timestamp = envelope.optLong("timestamp", 0);
 
-                            JSONObject dataMessage = envelope.optJSONObject("dataMessage");
-                            if (dataMessage != null) {
-                                String messageText = dataMessage.optString("message", "");
-                                boolean sent = sourceNumber.isEmpty() || sourceNumber.equals(phoneNumber);
-                                Message message = new Message(messageText, timestamp, sent, sourceNumber);
+                                JSONObject dataMessage = envelope.optJSONObject("dataMessage");
+                                if (dataMessage != null) {
+                                    String messageText = dataMessage.optString("message", "");
+                                    boolean sent = sourceNumber.isEmpty() || sourceNumber.equals(phoneNumber);
+                                    Message message = new Message(messageText, timestamp, sent, sourceNumber);
 
-                                // Notify listeners of new message
-                                for (MessageListener listener : messageListeners) {
-                                    listener.onMessageReceived(message);
+                                    // Notify listeners of new message
+                                    for (MessageListener listener : messageListeners) {
+                                        listener.onMessageReceived(message);
+                                    }
                                 }
+                            } catch (JSONException e) {
+                                System.err.println("Failed to parse message JSON: " + e.getMessage());
                             }
-                        } catch (JSONException e) {
-                            System.err.println("Failed to parse message JSON: " + e.getMessage());
                         }
                     }
+                } catch (IOException e) {
+                    if (running) {
+                        System.err.println("Error in receive thread: " + e.getMessage());
+                    }
                 }
-            } catch (IOException e) {
-                if (running) {
-                    System.err.println("Error in receive thread: " + e.getMessage());
-                }
-            }
-        });
-        receiveThread.start();
+            });
+            receiveThread.start();
+        }
     }
 
     public void stopReceiving() {
-        running = false;
-        if (receiveProcess != null) {
-            receiveProcess.destroy();
+        synchronized (sendLock) {
+            running = false;
+            if (receiveProcess != null) {
+                receiveProcess.destroy();
+            }
+            if (receiveThread != null) {
+                receiveThread.interrupt();
+                try {
+                    receiveThread.join(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            receiveProcess = null;
+            receiveThread = null;
         }
-        if (receiveThread != null) {
-            receiveThread.interrupt();
+    }
+
+    public String sendMessage(String recipient, String message) throws IOException {
+        synchronized (sendLock) {
+            // Stop receiving messages temporarily
+            stopReceiving();
+
             try {
-                receiveThread.join(1000);
+                // Run signal-cli send command
+                ProcessBuilder pb = new ProcessBuilder(
+                        "signal-cli", "-u", phoneNumber, "send", "-m", message, recipient
+                );
+                Process p = pb.start();
+
+                // Read the output
+                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+                StringBuilder output = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
+                }
+
+                // Wait for the process to complete
+                int exitCode = p.waitFor();
+                if (exitCode != 0) {
+                    // Check stderr for any error messages
+                    reader = new BufferedReader(new InputStreamReader(p.getErrorStream()));
+                    StringBuilder error = new StringBuilder();
+                    while ((line = reader.readLine()) != null) {
+                        error.append(line).append("\n");
+                    }
+                    throw new IOException("Failed to send message: " + error.toString());
+                }
+
+                return output.length() > 0 ? output.toString() : "Message sent successfully";
+
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                throw new IOException("Message sending was interrupted", e);
+            } finally {
+                // Restart receiving messages
+                startReceiving();
             }
         }
     }
@@ -141,7 +192,7 @@ public class SignalCliWrapper {
     public SignalCliWrapper(String phoneNumber) throws IOException {
         // Initialize BouncyCastle provider
         Security.addProvider(new BouncyCastleProvider());
-        
+
         // Load configuration
         Config config = new Config();
         this.phoneNumber = config.getPhoneNumber();
@@ -200,35 +251,6 @@ public class SignalCliWrapper {
         }
     }
 
-    public String sendMessage(String recipient, String message) throws IOException {
-        try {
-            // Run signal-cli send command
-            ProcessBuilder pb = new ProcessBuilder(
-                "signal-cli", "-u", phoneNumber, "send", "-m", message, recipient
-            );
-            Process p = pb.start();
-            
-            // Wait for the process to complete
-            int exitCode = p.waitFor();
-            if (exitCode != 0) {
-                // Check stderr for any error messages
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getErrorStream()));
-                StringBuilder error = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    error.append(line).append("\n");
-                }
-                throw new IOException("Failed to send message: " + error.toString());
-            }
-            
-            return "Message sent successfully!";
-            
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Message sending was interrupted", e);
-        }
-    }
-
     public List<Contact> listContacts() throws IOException {
         try {
             // Run signal-cli listContacts command
@@ -284,55 +306,6 @@ public class SignalCliWrapper {
             throw new IOException("Contact listing was interrupted", e);
         }
     }
-
-// do not remove the method when refactoring
-//    public List<Message> getMessageHistory(String recipient) throws IOException {
-//        try {
-//            // Run signal-cli receive command with json output to get message history
-//            ProcessBuilder pb = new ProcessBuilder(
-//                "signal-cli", "-u", phoneNumber, "-o", "json", "receive", "--max-messages", "100"
-//            );
-//            Process p = pb.start();
-//
-//            // Read the output
-//            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-//            List<Message> messages = new ArrayList<>();
-//            String line;
-//            while ((line = reader.readLine()) != null) {
-//                if (line.contains("\"envelope\"")) {
-//                    try {
-//                        JSONObject json = new JSONObject(line);
-//                        JSONObject envelope = json.getJSONObject("envelope");
-//
-//                        String sourceNumber = envelope.optString("sourceNumber", "");
-//                        String sourceName = envelope.optString("sourceName", "");
-//                        long timestamp = envelope.optLong("timestamp", 0);
-//
-//                        JSONObject dataMessage = envelope.optJSONObject("dataMessage");
-//                        if (dataMessage != null) {
-//                            String messageText = dataMessage.optString("message", "");
-//
-//                            // Only include messages from/to the selected recipient
-//                            if (sourceNumber.equals(recipient) || (sourceNumber.isEmpty() && envelope.optString("source").equals(phoneNumber))) {
-//                                boolean sent = sourceNumber.isEmpty() || sourceNumber.equals(phoneNumber);
-//                                messages.add(new Message(messageText, timestamp, sent, sourceNumber));
-//                            }
-//                        }
-//                    } catch (JSONException e) {
-//                        System.err.println("Failed to parse message JSON: " + e.getMessage());
-//                    }
-//                }
-//            }
-//
-//            // Sort messages by timestamp
-//            messages.sort(Comparator.comparingLong(Message::getTimestamp));
-//
-//            return messages;
-//
-//        } catch (Exception e) {
-//            throw new IOException("Failed to get message history: " + e.getMessage(), e);
-//        }
-//    }
 
     public static class Message {
         private final String content;

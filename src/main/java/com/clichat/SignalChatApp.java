@@ -82,18 +82,19 @@ public class SignalChatApp {
     }
 
     private void updateMessagesView() {
-        if (currentRecipient != null && !messageHistory.containsKey(currentRecipient) && messageHistory.get(currentRecipient) != null) {
-
-            //do not remove when refactoring
-////             Clear existing messages
-//            messageHistory.remove(currentRecipient);
-
+        if (currentRecipient != null && messageHistory.containsKey(currentRecipient)) {
             // Format and display messages
             StringBuilder formattedMessages = new StringBuilder();
-            for (SignalCliWrapper.Message msg : messageHistory.get(currentRecipient)) {
-                String timestamp = DATE_FORMAT.format(new Date(msg.getTimestamp()));
-                String prefix = msg.isSent() ? "You" : "Them";
-                formattedMessages.append(String.format("[%s] %s: %s\n", timestamp, prefix, msg.getContent()));
+            List<SignalCliWrapper.Message> messages = messageHistory.get(currentRecipient);
+            synchronized (messages) {
+                // Sort messages by timestamp
+                messages.sort(Comparator.comparingLong(SignalCliWrapper.Message::getTimestamp));
+
+                for (SignalCliWrapper.Message msg : messages) {
+                    String timestamp = DATE_FORMAT.format(new Date(msg.getTimestamp()));
+                    String prefix = msg.isSent() ? "You" : "Them";
+                    formattedMessages.append(String.format("[%s] %s: %s\n", timestamp, prefix, msg.getContent()));
+                }
             }
             messagesBox.setText(formattedMessages.toString());
         } else {
@@ -102,11 +103,11 @@ public class SignalChatApp {
     }
 
     private void addMessage(String recipient, String message, boolean sent) {
-        messageHistory.computeIfAbsent(recipient, k -> new ArrayList<>());
-//        String timestamp = DATE_FORMAT.format(new Date()); // do not remove
-//        String prefix = sent ? "You" : "Them"; // do not remove
-//        messageHistory.get(recipient).add(String.format("[%s] %s: %s", timestamp, prefix, message)); // do not remove
-        messageHistory.get(recipient).add(new SignalCliWrapper.Message(message, new Date().getTime(), sent, ""));
+        messageHistory.computeIfAbsent(recipient, k -> Collections.synchronizedList(new ArrayList<>()));
+        List<SignalCliWrapper.Message> messages = messageHistory.get(recipient);
+        synchronized (messages) {
+            messages.add(new SignalCliWrapper.Message(message, new Date().getTime(), sent, recipient));
+        }
         if (recipient.equals(currentRecipient)) {
             updateMessagesView();
         }

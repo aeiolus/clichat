@@ -182,4 +182,93 @@ public class SignalCliWrapper {
             throw new IOException("Message receiving was interrupted", e);
         }
     }
+
+    public List<Contact> listContacts() throws IOException {
+        try {
+            // Run signal-cli listContacts command
+            ProcessBuilder pb = new ProcessBuilder(
+                    "signal-cli", "-u", phoneNumber, "listContacts"
+            );
+            Process p = pb.start();
+
+            // Read the output
+            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            List<Contact> contacts = new ArrayList<>();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("Number: ")) {
+                    // Parse contact information
+                    String[] parts = line.split(" ");
+                    String number = null;
+                    String name = "";
+                    String profileName = "";
+
+                    for (int i = 0; i < parts.length; i++) {
+                        if (parts[i].equals("Number:") && i + 1 < parts.length) {
+                            number = parts[i + 1];
+                        } else if (parts[i].equals("Name:") && i + 1 < parts.length) {
+                            name = parts[i + 1];
+                        } else if (parts[i].equals("Profile") && parts[i + 1].equals("name:") && i + 2 < parts.length) {
+                            profileName = parts[i + 2];
+                        }
+                    }
+
+                    if (number != null && !number.isEmpty()) {
+                        contacts.add(new Contact(number, name, profileName));
+                    }
+                }
+            }
+
+            // Wait for the process to complete
+            int exitCode = p.waitFor();
+            if (exitCode != 0) {
+                // Check stderr for any error messages
+                reader = new BufferedReader(new InputStreamReader(p.getErrorStream()));
+                StringBuilder error = new StringBuilder();
+                while ((line = reader.readLine()) != null) {
+                    error.append(line).append("\n");
+                }
+                throw new IOException("Failed to list contacts: " + error.toString());
+            }
+
+            return contacts;
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Contact listing was interrupted", e);
+        }
+    }
+
+    public static class Contact {
+        private final String number;
+        private final String name;
+        private final String profileName;
+
+        public Contact(String number, String name, String profileName) {
+            this.number = number;
+            this.name = name;
+            this.profileName = profileName;
+        }
+
+        public String getNumber() {
+            return number;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public String getProfileName() {
+            return profileName;
+        }
+
+        public String getDisplayName() {
+            if (!name.isEmpty()) {
+                return name;
+            } else if (!profileName.isEmpty()) {
+                return profileName;
+            }
+            return number;
+        }
+    }
 }

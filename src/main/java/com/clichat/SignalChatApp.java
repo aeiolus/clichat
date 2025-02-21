@@ -23,6 +23,7 @@ public class SignalChatApp {
     private String currentRecipient;
     private Map<String, List<String>> messageHistory;
     private TextBox messagesBox;
+    private ActionListBox contactsList;
 
     public SignalChatApp() {
         try {
@@ -74,6 +75,20 @@ public class SignalChatApp {
         }
     }
 
+    private void loadContacts() {
+        try {
+            List<SignalCliWrapper.Contact> contacts = signalCli.listContacts();
+            for (SignalCliWrapper.Contact contact : contacts) {
+                contactsList.addItem(contact.getDisplayName(), () -> {
+                    currentRecipient = contact.getNumber();
+                    updateMessagesView();
+                });
+            }
+        } catch (IOException e) {
+            MessageDialog.showMessageDialog(gui, "Error", "Failed to load contacts: " + e.getMessage());
+        }
+    }
+
     private void showMainWindow() throws IOException {
         // Get terminal size
         TerminalSize terminalSize = screen.getTerminalSize();
@@ -95,12 +110,16 @@ public class SignalChatApp {
         Panel contactsPanel = new Panel(new GridLayout(1));
         contactsPanel.setPreferredSize(new TerminalSize(leftWidth, height));
 
-        ActionListBox contactsList = new ActionListBox(new TerminalSize(leftWidth - 2, height - 2));
+        contactsList = new ActionListBox(new TerminalSize(leftWidth - 2, height - 2));
         contactsList.addItem("+ Add Contact", () -> {
             MessageDialog.showMessageDialog(gui, "Add Contact", "Enter phone number in the message input below");
             currentRecipient = null;
             updateMessagesView();
         });
+
+        // Load existing contacts
+        loadContacts();
+        
         contactsPanel.addComponent(contactsList);
         mainPanel.addComponent(contactsPanel.withBorder(Borders.singleLine("Contacts")));
 

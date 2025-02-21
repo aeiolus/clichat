@@ -10,18 +10,20 @@ import com.googlecode.lanterna.terminal.DefaultTerminalFactory;
 import com.googlecode.lanterna.terminal.Terminal;
 
 import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.regex.Pattern;
 
 public class SignalChatApp {
     private static final Pattern PHONE_NUMBER_PATTERN = Pattern.compile("^\\+[1-9]\\d{1,14}$");
+    private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
     private Terminal terminal;
     private Screen screen;
     private WindowBasedTextGUI gui;
     private SignalCliWrapper signalCli;
     private Config config;
     private String currentRecipient;
-    private Map<String, List<String>> messageHistory;
+    private Map<String, List<SignalCliWrapper.Message>> messageHistory;
     private TextBox messagesBox;
     private ActionListBox contactsList;
 
@@ -31,6 +33,31 @@ public class SignalChatApp {
             signalCli = new SignalCliWrapper(config.getPhoneNumber());
             messageHistory = new HashMap<>();
             setupTerminal();
+
+            // Start receiving messages in background
+            signalCli.addMessageListener(message -> {
+                String recipient = message.getSourceNumber();
+                if (recipient == null || recipient.isEmpty()) {
+                    recipient = config.getPhoneNumber();
+                }
+                addMessage(recipient, message.getContent(), message.isSent());
+            });
+            signalCli.startReceiving();
+
+            // Add shutdown hook to cleanup resources
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    signalCli.stopReceiving();
+                    if (screen != null) {
+                        screen.stopScreen();
+                    }
+                    if (terminal != null) {
+                        terminal.close();
+                    }
+                } catch (IOException e) {
+                    System.err.println("Error during shutdown: " + e.getMessage());
+                }
+            }));
         } catch (IOException e) {
             System.err.println("Failed to initialize Signal Chat App: " + e.getMessage());
             System.exit(1);
@@ -55,12 +82,20 @@ public class SignalChatApp {
     }
 
     private void updateMessagesView() {
-        if (currentRecipient != null && messageHistory.containsKey(currentRecipient)) {
-            StringBuilder messages = new StringBuilder();
-            for (String msg : messageHistory.get(currentRecipient)) {
-                messages.append(msg).append("\n");
+        if (currentRecipient != null && !messageHistory.containsKey(currentRecipient) && messageHistory.get(currentRecipient) != null) {
+
+            //do not remove when refactoring
+////             Clear existing messages
+//            messageHistory.remove(currentRecipient);
+
+            // Format and display messages
+            StringBuilder formattedMessages = new StringBuilder();
+            for (SignalCliWrapper.Message msg : messageHistory.get(currentRecipient)) {
+                String timestamp = DATE_FORMAT.format(new Date(msg.getTimestamp()));
+                String prefix = msg.isSent() ? "You" : "Them";
+                formattedMessages.append(String.format("[%s] %s: %s\n", timestamp, prefix, msg.getContent()));
             }
-            messagesBox.setText(messages.toString());
+            messagesBox.setText(formattedMessages.toString());
         } else {
             messagesBox.setText("");
         }
@@ -68,8 +103,10 @@ public class SignalChatApp {
 
     private void addMessage(String recipient, String message, boolean sent) {
         messageHistory.computeIfAbsent(recipient, k -> new ArrayList<>());
-        String prefix = sent ? "You: " : "Them: ";
-        messageHistory.get(recipient).add(prefix + message);
+//        String timestamp = DATE_FORMAT.format(new Date()); // do not remove
+//        String prefix = sent ? "You" : "Them"; // do not remove
+//        messageHistory.get(recipient).add(String.format("[%s] %s: %s", timestamp, prefix, message)); // do not remove
+        messageHistory.get(recipient).add(new SignalCliWrapper.Message(message, new Date().getTime(), sent, ""));
         if (recipient.equals(currentRecipient)) {
             updateMessagesView();
         }
@@ -119,7 +156,7 @@ public class SignalChatApp {
 
         // Load existing contacts
         loadContacts();
-        
+
         contactsPanel.addComponent(contactsList);
         mainPanel.addComponent(contactsPanel.withBorder(Borders.singleLine("Contacts")));
 
